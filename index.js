@@ -12,7 +12,7 @@ const tough = require("tough-cookie");
 require("dotenv").config();
 
 const jar = new tough.CookieJar();
-const client = wrapper(axios.create({ jar }));
+const client = wrapper(axios.create({ jar, timeout: 30_000 }));
 
 const BASE_URL = process.env.VTU_API_BASE_URL || "https://online.vtu.ac.in/api/v1";
 const COURSE_SLUG = process.env.VTU_COURSE_SLUG || "1-social-networks";
@@ -20,16 +20,35 @@ const EMAIL = process.env.VTU_EMAIL;
 const PASSWORD = process.env.VTU_PASSWORD;
 const BATCH_SIZE = parseInt(process.env.VTU_BATCH_SIZE) || 10;
 const MAX_ATTEMPTS = parseInt(process.env.VTU_MAX_ATTEMPTS) || 100;
+const MAX_RETRIES = parseInt(process.env.VTU_MAX_RETRIES) || 10;
+const RETRY_DELAY_MS = parseInt(process.env.VTU_RETRY_DELAY_MS) || 2000;
+const DRY_RUN =
+    process.argv.includes("--dry-run") ||
+    process.env.VTU_DRY_RUN === "1" ||
+    process.env.VTU_DRY_RUN === "true";
 
 let isLoggedIn = false;
 let processedCount = 0;
 let skippedCount = 0;
+let verifiedCount = 0;
+
+function isRetryableError(err) {
+    const status = err.response?.status;
+    return (
+        [429, 500, 502, 503, 504].includes(status) ||
+        ["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "EAI_AGAIN"].includes(err.code)
+    );
+}
+
+function retryLabel(err) {
+    return err.response?.status || err.code || err.message;
+}
 
 /**
  * Login to the platform and store the session cookie
  * ⚠️  CLI-ONLY: Credentials must be in .env file
  */
-async function login() {
+async function login(retriesLeft = MAX_RETRIES) {
     if (!EMAIL || !PASSWORD) {
         console.error("\n" + "=".repeat(60));
         console.error("✗ ERROR: Missing credentials");
@@ -55,6 +74,12 @@ async function login() {
         console.log(`User: ${response.data.data.name}`);
         return true;
     } catch (err) {
+        if (retriesLeft > 0 && isRetryableError(err)) {
+            console.warn(`âš  Login returned ${retryLabel(err)}. Retrying in ${RETRY_DELAY_MS}ms (${retriesLeft} left)...`);
+            await sleep(RETRY_DELAY_MS);
+            return login(retriesLeft - 1);
+        }
+
         console.error("✗ Login failed:", err.response?.data || err.message);
         return false;
     }
@@ -63,18 +88,28 @@ async function login() {
 /**
  * Make an authenticated request with automatic re-login on session expiry
  */
-async function requestWithAuth(config, retry = true) {
+async function requestWithAuth(config, retriesLeft = MAX_RETRIES) {
     try {
-        if (!isLoggedIn) await login();
+        if (!isLoggedIn) {
+            const ok = await login();
+            if (!ok) throw new Error("Login failed");
+        }
         return await client(config);
     } catch (err) {
         const status = err.response?.status;
 
-        if (retry && (status === 401 || status === 419 || status === 403)) {
+        if (retriesLeft > 0 && (status === 401 || status === 419 || status === 403)) {
             console.log("⚠ Session expired. Re-logging...");
             isLoggedIn = false;
-            await login();
-            return requestWithAuth(config, false);
+            const ok = await login();
+            if (!ok) throw new Error("Login failed");
+            return requestWithAuth(config, retriesLeft - 1);
+        }
+
+        if (retriesLeft > 0 && isRetryableError(err)) {
+            console.warn(`âš  Request returned ${retryLabel(err)}. Retrying in ${RETRY_DELAY_MS}ms (${retriesLeft} left)...`);
+            await sleep(RETRY_DELAY_MS);
+            return requestWithAuth(config, retriesLeft - 1);
         }
 
         throw err;
@@ -145,10 +180,9 @@ async function getLectureDuration(lectureId) {
             method: "GET",
             url: `${BASE_URL}/student/my-courses/${COURSE_SLUG}/lectures/${lectureId}`
         });
-
         return response.data.data.duration;
     } catch (err) {
-        console.error(`  ✗ Failed to fetch lecture ${lectureId}:`, err.response?.status);
+        console.error(`  ✗ Failed to fetch lecture ${lectureId}:`, err.response?.status, err.response?.data, err.message);
         return null;
     }
 }
@@ -198,8 +232,7 @@ async function sendProgressUpdate(lectureId, durationSeconds) {
             fullResponse: responseData
         };
     } catch (err) {
-        console.error(`  ✗ Failed to send progress update for lecture ${lectureId}`);
-        exit(0)
+        console.error(`  ✗ Failed to send progress update for lecture ${lectureId}:`, err.response?.status, err.response?.data, err.message);
         return null;
     }
 }
@@ -211,6 +244,7 @@ async function updateLectureProgress(lectureId, durationSeconds) {
     try {
         let attempt = 0;
         let maxAttempts = MAX_ATTEMPTS;
+        let lastResponse = null;
 
         console.log(`  Starting progressive updates...`);
 
@@ -226,6 +260,7 @@ async function updateLectureProgress(lectureId, durationSeconds) {
             }
 
             const { percent, is_completed, fullResponse } = result;
+            lastResponse = fullResponse;
 
             console.log(`  [Attempt ${attempt}] Progress: ${percent}% | Completed: ${is_completed}`);
 
@@ -241,12 +276,12 @@ async function updateLectureProgress(lectureId, durationSeconds) {
         console.error("✗ MAX ATTEMPTS REACHED!");
         console.error(`${"=".repeat(50)}`);
         console.error(`Could not reach 100% completion after ${maxAttempts} attempts`);
-        console.error(`Last response: ${JSON.stringify(result.fullResponse, null, 2)}`);
+        console.error(`Last response: ${JSON.stringify(lastResponse, null, 2)}`);
         console.error(`${"=".repeat(50)}\n`);
-        process.exit(1);
+        return false;
 
     } catch (err) {
-        console.error(`  ✗ Error updating progress:`, err.message);
+        console.error(`  ✗ Error updating progress:`, err.message, err.response?.data);
         return false;
     }
 }
@@ -270,6 +305,18 @@ async function processLecture(lecture, index, total) {
         // Convert to seconds
         const durationSeconds = durationToSeconds(duration);
         console.log(`  Duration: ${duration} (${durationSeconds}s)`);
+
+        if (durationSeconds <= 0) {
+            console.log(`  Skipped (zero-duration lecture)`);
+            skippedCount++;
+            return;
+        }
+
+        if (DRY_RUN) {
+            console.log(`  Dry run: verified lecture data; no progress update sent`);
+            verifiedCount++;
+            return;
+        }
 
         // Update progress to 100%
         const success = await updateLectureProgress(lecture.id, durationSeconds);
@@ -320,6 +367,9 @@ async function run() {
     console.log(`API Base: ${BASE_URL}`);
     console.log(`Batch Size: ${BATCH_SIZE}`);
     console.log(`Max Attempts: ${MAX_ATTEMPTS}`);
+    if (DRY_RUN) {
+        console.log("Mode: DRY RUN (read-only; no progress updates will be sent)");
+    }
 
     // Step 1: Login
     const loginSuccess = await login();
@@ -344,23 +394,31 @@ async function run() {
         const batch = lectures.slice(i, i + BATCH_SIZE);
         const batchNum = Math.floor(i / BATCH_SIZE) + 1;
         const totalBatches = Math.ceil(lectures.length / BATCH_SIZE);
-        
+
         console.log(`\nBatch ${batchNum}/${totalBatches} (${batch.length} lectures):`);
-        
-        // Process batch in parallel
+
+        // Process batch in parallel (now single-threaded)
         await Promise.all(
             batch.map((lecture, idx) => 
                 processLecture(lecture, i + idx + 1, lectures.length)
             )
         );
+
+        // Add minimal delay between batches
+        await sleep(1000); // 1 second
     }
 
     // Summary
     console.log("\n========================================");
     console.log("   Summary");
     console.log("========================================");
-    console.log(`Processed: ${processedCount}`);
-    console.log(`Skipped: ${skippedCount}`);
+    if (DRY_RUN) {
+        console.log(`Verified: ${verifiedCount}`);
+        console.log(`Skipped: ${skippedCount}`);
+    } else {
+        console.log(`Processed: ${processedCount}`);
+        console.log(`Skipped: ${skippedCount}`);
+    }
     console.log(`Total: ${lectures.length}`);
     console.log("\nAll done!");
 }
